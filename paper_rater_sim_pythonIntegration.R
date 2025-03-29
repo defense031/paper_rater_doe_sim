@@ -16,7 +16,7 @@ pulp <- import("pulp")
 # ---------------------------
 # 1. Define Simulation Parameters
 # ---------------------------
-n_papers <- 5000
+n_papers <- 7500
 min_papers <- 30
 max_papers <- 150
 
@@ -528,3 +528,133 @@ heatmap_demo <- ggplot(paper_counts, aes(x = factor(true_rating), y = factor(avg
   theme_minimal()
 
 print(heatmap_demo)
+
+
+
+
+
+
+
+
+
+################# Now let's map this to an epoch based sim with multiple runs ########################
+# Number of epochs to run
+num_epochs <- 50
+
+# Initialize a list to store epoch-level results.
+epoch_results_list <- vector("list", num_epochs)
+
+# Loop over epochs
+for(epoch in 1:num_epochs) {
+  
+  epoch_results <- data.frame()
+  
+  for(good_prop in good_prop_values) {
+    
+    # Scale non-good types proportionally.
+    non_good_total <- 1 - good_prop
+    new_non_good <- default_non_good / default_non_good_sum * non_good_total
+    new_grader_proportions <- c(good = good_prop, new_non_good)
+    names(new_grader_proportions)[-1] <- names(default_non_good)
+    
+    # Run simulations.
+    sim_rand <- run_simulation_random(n_papers, n_graders, min_papers, max_papers,
+                                      rating_probs, grader_profiles, new_grader_proportions)
+    sim_match <- run_simulation_matched(n_papers, n_graders, min_papers, max_papers,
+                                        rating_probs, grader_profiles, new_grader_proportions)
+    
+    # Bias estimation and selective correction.
+    sim_rand$sim_data <- estimate_biases(sim_rand$sim_data)
+    sim_match$sim_data <- estimate_biases(sim_match$sim_data)
+    sim_rand$sim_data <- apply_selective_correction(sim_rand$sim_data, bias_threshold)
+    sim_match$sim_data <- apply_selective_correction(sim_match$sim_data, bias_threshold)
+    
+    # Aggregate paper-level scores.
+    paper_rand <- aggregate_paper_scores(sim_rand$sim_data)
+    paper_match <- aggregate_paper_scores(sim_match$sim_data)
+    
+    # Compute classification rate.
+    cr_rand <- mean(paper_rand$avg_corrected_score == paper_rand$true_rating)
+    cr_match <- mean(paper_match$avg_corrected_score == paper_match$true_rating)
+    
+    # Compute macro F1 for raw scores.
+    macro_f1_rand_raw <- compute_multinomial_F1(paper_rand$true_rating, paper_rand$avg_raw_score)$macro_f1
+    if(length(macro_f1_rand_raw) == 0) macro_f1_rand_raw <- NA
+    
+    macro_f1_match_raw <- compute_multinomial_F1(paper_match$true_rating, paper_match$avg_raw_score)$macro_f1
+    if(length(macro_f1_match_raw) == 0) macro_f1_match_raw <- NA
+    
+    # Compute macro F1 for corrected scores.
+    F1_rand <- compute_multinomial_F1(paper_rand$true_rating, paper_rand$avg_corrected_score)$macro_f1
+    F1_match <- compute_multinomial_F1(paper_match$true_rating, paper_match$avg_corrected_score)$macro_f1
+    
+    # Combine metrics for this good_prop.
+    epoch_results <- rbind(epoch_results,
+                           data.frame(epoch = epoch, good_prop = good_prop, method = "Random", version = "Raw",
+                                      classification_rate = mean(paper_rand$avg_raw_score == paper_rand$true_rating),
+                                      macro_f1 = macro_f1_rand_raw),
+                           data.frame(epoch = epoch, good_prop = good_prop, method = "Random", version = "Corrected",
+                                      classification_rate = cr_rand,
+                                      macro_f1 = F1_rand),
+                           data.frame(epoch = epoch, good_prop = good_prop, method = "Matched", version = "Raw",
+                                      classification_rate = mean(paper_match$avg_raw_score == paper_match$true_rating),
+                                      macro_f1 = macro_f1_match_raw),
+                           data.frame(epoch = epoch, good_prop = good_prop, method = "Matched", version = "Corrected",
+                                      classification_rate = cr_match,
+                                      macro_f1 = F1_match)
+    )
+    
+  } # end loop over good_prop values
+  
+  epoch_results_list[[epoch]] <- epoch_results
+  cat("Epoch", epoch, "completed\n")
+}
+
+# Combine results from all epochs.
+all_results_df <- do.call(rbind, epoch_results_list)
+
+# Aggregate over epochs to compute means and 95% confidence intervals.
+summary_results <- all_results_df %>%
+  group_by(good_prop, method, version) %>%
+  summarise(
+    classification_rate_mean = mean(classification_rate, na.rm = TRUE),
+    classification_rate_se   = sd(classification_rate, na.rm = TRUE) / sqrt(n()),
+    macro_f1_mean            = mean(macro_f1, na.rm = TRUE),
+    macro_f1_se              = sd(macro_f1, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(summary_results)
+
+# ---------------------------
+# Visualization
+# ---------------------------
+
+# Plot for classification rate with 95% CI.
+p_cr <- ggplot(summary_results, aes(x = good_prop, y = classification_rate_mean, color = method, linetype = version)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_ribbon(aes(ymin = classification_rate_mean - 1.96 * classification_rate_se,
+                  ymax = classification_rate_mean + 1.96 * classification_rate_se,
+                  fill = method), alpha = 0.2, color = NA) +
+  labs(title = "Paper-Averaged Classification Rate vs. Good Grader Proportion",
+       x = "Proportion of Good Graders", y = "Classification Rate") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal()
+
+# Plot for Macro F1 score with 95% CI.
+p_F1 <- ggplot(summary_results, aes(x = good_prop, y = macro_f1_mean, color = method, linetype = version)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_ribbon(aes(ymin = macro_f1_mean - 1.96 * macro_f1_se,
+                  ymax = macro_f1_mean + 1.96 * macro_f1_se,
+                  fill = method), alpha = 0.2, color = NA) +
+  labs(title = "Macro F1 Score vs. Good Grader Proportion",
+       x = "Proportion of Good Graders", y = "Macro F1 Score") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal()
+
+print(p_cr)
+print(p_F1)
+
